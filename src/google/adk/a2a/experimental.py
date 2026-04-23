@@ -16,19 +16,18 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from google.adk.utils.feature_decorator import _make_feature_decorator
 
-a2a_experimental = _make_feature_decorator(
-    label="EXPERIMENTAL",
-    default_message=(
-        "ADK Implementation for A2A support (A2aAgentExecutor, RemoteA2aAgent "
-        "and corresponding supporting components etc.) is in experimental mode "
-        "and is subject to breaking changes. A2A protocol and SDK are "
-        "themselves not experimental. Once it's stable enough the experimental "
-        "mode will be removed. Your feedback is welcome."
-    ),
-    bypass_env_var="ADK_SUPPRESS_A2A_EXPERIMENTAL_FEATURE_WARNINGS",
-)
+
+def a2a_experimental(message_or_obj: Any = None) -> Any:
+    if message_or_obj is not None and (
+        isinstance(message_or_obj, type) or callable(message_or_obj)
+    ):
+        return message_or_obj
+    return lambda obj: obj
+
 """Mark a class or function as experimental A2A feature.
 
 This decorator shows a specific warning message for A2A functionality,

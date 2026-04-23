@@ -231,7 +231,7 @@ class RemoteA2aAgent(BaseAgent):
     if not self._a2a_client_factory:
       client_config = A2AClientConfig(
           httpx_client=self._httpx_client,
-          streaming=False,
+          streaming=self._config.streaming,
           polling=False,
           supported_transports=[A2ATransport.jsonrpc, A2ATransport.http_json],
       )

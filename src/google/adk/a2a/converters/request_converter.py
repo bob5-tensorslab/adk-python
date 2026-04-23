@@ -23,6 +23,7 @@ from google.genai import types as genai_types
 from pydantic import BaseModel
 
 from ...runners import RunConfig
+from ...agents.run_config import StreamingMode
 from ..experimental import a2a_experimental
 from .part_converter import A2APartToGenAIPartConverter
 from .part_converter import convert_a2a_part_to_genai_part
@@ -113,5 +114,8 @@ def convert_a2a_request_to_agent_run_request(
           role='user',
           parts=output_parts,
       ),
-      run_config=RunConfig(custom_metadata=custom_metadata),
+      run_config=RunConfig(
+          custom_metadata=custom_metadata,
+          streaming_mode=StreamingMode.SSE,
+      ),
   )

@@ -109,6 +109,7 @@ class A2aRemoteAgentConfig(BaseModel):
   )
 
   request_interceptors: Optional[list[RequestInterceptor]] = None
+  streaming: bool = False
 
   def __deepcopy__(self, memo):
     cls = self.__class__

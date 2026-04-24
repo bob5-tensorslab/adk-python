@@ -17,7 +17,6 @@
 import pathlib
 
 from google.adk import Agent
-from google.adk.code_executors.unsafe_local_code_executor import UnsafeLocalCodeExecutor
 from google.adk.skills import load_skill_from_dir
 from google.adk.skills import models
 from google.adk.tools.base_tool import BaseTool
@@ -83,12 +82,9 @@ weather_skill = load_skill_from_dir(
     pathlib.Path(__file__).parent / "skills" / "weather-skill"
 )
 
-# WARNING: UnsafeLocalCodeExecutor has security concerns and should NOT
-# be used in production environments.
 my_skill_toolset = SkillToolset(
     skills=[greeting_skill, weather_skill],
     additional_tools=[GetTimezoneTool(), get_wind_speed],
-    code_executor=UnsafeLocalCodeExecutor(),
 )
 
 root_agent = Agent(

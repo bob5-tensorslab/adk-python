@@ -22,6 +22,8 @@ import asyncio
 import json
 import logging
 import mimetypes
+import os
+import tempfile
 from typing import Any
 from typing import Optional
 from typing import TYPE_CHECKING
@@ -170,10 +172,15 @@ class LoadSkillTool(BaseTool):
       activated_skills.append(skill_name)
       tool_context.state[state_key] = activated_skills
 
+    # Materialize resources to temp dir
+    base_directory, files = self._toolset._materialize_skill(skill)
+
     return {
         "skill_name": skill_name,
         "instructions": skill.instructions,
         "frontmatter": skill.frontmatter.model_dump(),
+        "base_directory": base_directory,
+        "files": files,
     }
 
 
@@ -805,6 +812,7 @@ class SkillToolset(BaseToolset):
     self._code_executor = code_executor
     self._script_timeout = script_timeout
     self._use_invocation_cache = False
+    self._skill_dirs: dict[str, str] = {}
 
     self._provided_tools_by_name = {}
     self._provided_toolsets = []
@@ -887,6 +895,61 @@ class SkillToolset(BaseToolset):
         existing_tool_names.add(tool.name)
 
     return resolved_tools
+
+  def _materialize_skill(self, skill: models.Skill) -> tuple[str, list[str]]:
+    """Writes all skill resources to a temp directory.
+
+    Returns:
+        (base_directory, file_list)
+    """
+    if skill.name in self._skill_dirs:
+      base_dir = self._skill_dirs[skill.name]
+      file_list = []
+      for root, _dirs, fnames in os.walk(base_dir):
+        for fname in fnames:
+          full = os.path.join(root, fname)
+          file_list.append(os.path.relpath(full, base_dir).replace(os.sep, "/"))
+      return base_dir, sorted(file_list)
+
+    base_dir = tempfile.mkdtemp(prefix=f"adk_skill_{skill.name}_")
+    self._skill_dirs[skill.name] = base_dir
+
+    file_list: list[str] = []
+
+    for ref_name in skill.resources.list_references():
+      content = skill.resources.get_reference(ref_name)
+      if content is not None:
+        rel_path = f"references/{ref_name}"
+        full_path = os.path.join(base_dir, rel_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        mode = "wb" if isinstance(content, bytes) else "w"
+        with open(full_path, mode) as f:
+          f.write(content)
+        file_list.append(rel_path)
+
+    for asset_name in skill.resources.list_assets():
+      content = skill.resources.get_asset(asset_name)
+      if content is not None:
+        rel_path = f"assets/{asset_name}"
+        full_path = os.path.join(base_dir, rel_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        mode = "wb" if isinstance(content, bytes) else "w"
+        with open(full_path, mode) as f:
+          f.write(content)
+        file_list.append(rel_path)
+
+    for scr_name in skill.resources.list_scripts():
+      scr = skill.resources.get_script(scr_name)
+      if scr is not None and scr.src is not None:
+        rel_path = f"scripts/{scr_name}"
+        full_path = os.path.join(base_dir, rel_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        mode = "wb" if isinstance(scr.src, bytes) else "w"
+        with open(full_path, mode) as f:
+          f.write(scr.src)
+        file_list.append(rel_path)
+
+    return base_dir, sorted(file_list)
 
   def _get_skill(self, skill_name: str) -> models.Skill | None:
     """Retrieves a skill by name."""

@@ -249,7 +249,13 @@ async def test_load_skill_run_async(
   toolset = skill_toolset.SkillToolset([mock_skill1])
   tool = skill_toolset.LoadSkillTool(toolset)
   result = await tool.run_async(args=args, tool_context=tool_context_instance)
-  assert result == expected_result
+  # Check expected fields (exact match for error cases, subset for success)
+  for key, value in expected_result.items():
+    assert result[key] == value
+  # Success case now also returns base_directory and files
+  if "error" not in result:
+    assert "base_directory" in result
+    assert "files" in result
 
 
 @pytest.mark.asyncio
@@ -272,6 +278,40 @@ async def test_load_skill_run_async_state_none(
   tool_context_instance.state.__setitem__.assert_called_with(
       state_key, ["skill1"]
   )
+
+
+@pytest.mark.asyncio
+async def test_load_skill_materializes_resources(mock_skill1, tmp_path):
+    """load_skill should create a temp dir with skill resources and return base_directory."""
+    toolset = skill_toolset.SkillToolset([mock_skill1])
+    tool = skill_toolset.LoadSkillTool(toolset)
+    ctx = _make_tool_context_with_agent()
+    result = await tool.run_async(
+        args={"skill_name": "skill1"},
+        tool_context=ctx,
+    )
+    assert "base_directory" in result
+    assert "files" in result
+    file_list = result["files"]
+    assert any("ref1.md" in f for f in file_list)
+    assert any("setup.sh" in f for f in file_list)
+
+
+@pytest.mark.asyncio
+async def test_load_skill_files_exist_on_disk(mock_skill1):
+    """Files returned by load_skill should actually exist on disk."""
+    toolset = skill_toolset.SkillToolset([mock_skill1])
+    tool = skill_toolset.LoadSkillTool(toolset)
+    ctx = _make_tool_context_with_agent()
+    result = await tool.run_async(
+        args={"skill_name": "skill1"},
+        tool_context=ctx,
+    )
+    import pathlib
+    base = pathlib.Path(result["base_directory"])
+    assert base.exists()
+    assert (base / "references" / "ref1.md").exists()
+    assert (base / "references" / "ref1.md").read_text() == "ref content 1"
 
 
 @pytest.mark.asyncio

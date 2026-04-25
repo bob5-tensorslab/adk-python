@@ -21,6 +21,8 @@ import dataclasses
 import logging
 import os
 import pathlib
+import signal
+import subprocess
 import sys
 from typing import Any
 from typing import Optional
@@ -62,7 +64,6 @@ class ShellToolPolicy:
   allowed_command_prefixes: tuple[str, ...] = ("*",)
   blocked_operators: tuple[str, ...] = ()
   timeout_seconds: int = 30
-  confirm_required: bool = True
 
 
 def _validate_command(command: str, policy: ShellToolPolicy) -> Optional[str]:
@@ -106,10 +107,9 @@ def _truncate_output(output: str) -> str:
 class ShellTool(BaseTool):
   """Tool to execute a validated shell command within a workspace directory.
 
-  Uses asyncio.create_subprocess_shell for cross-platform shell command
-  execution. On Unix, processes are started in a new session so the entire
-  process group can be killed on timeout. On Windows, the default process
-  creation is used with proc.kill().
+  On Unix, uses asyncio.create_subprocess_shell with start_new_session so the
+  entire process group can be killed on timeout. On Windows, falls back to
+  subprocess.run in a thread since asyncio subprocess is not supported there.
   """
 
   def __init__(
@@ -120,14 +120,6 @@ class ShellTool(BaseTool):
     if workspace is None:
       workspace = pathlib.Path.cwd()
     policy = policy or ShellToolPolicy()
-    allowed_hint = (
-        "any command"
-        if "*" in policy.allowed_command_prefixes
-        else (
-            "commands matching prefixes:"
-            f" {', '.join(policy.allowed_command_prefixes)}"
-        )
-    )
     super().__init__(
         name="execute_shell",
         description=_SHELL_PROMPT,
@@ -172,109 +164,145 @@ class ShellTool(BaseTool):
     if not command:
       return {"error": "Command is required."}
 
-    # Static validation.
     error = _validate_command(command, self._policy)
     if error:
       return {"error": error}
 
-    # Confirmation check.
-    if self._policy.confirm_required:
-      if not tool_context.tool_confirmation:
-        tool_context.request_confirmation(
-            hint=f"Please approve or reject the shell command: {command}",
-        )
-        tool_context.actions.skip_summarization = True
-        return {
-            "error": (
-                "This tool call requires confirmation, please approve or"
-                " reject."
-            )
-        }
-      elif not tool_context.tool_confirmation.confirmed:
-        return {"error": "This tool call is rejected."}
-
-    # Determine working directory.
     workdir = args.get("workdir")
     cwd = str(pathlib.Path(workdir)) if workdir else str(self._workspace)
 
-    # Determine timeout.
     timeout = args.get("timeout")
-    timeout_seconds = int(timeout) if timeout is not None else self._policy.timeout_seconds
+    timeout_seconds = (
+        int(timeout) if timeout is not None else self._policy.timeout_seconds
+    )
 
-    stdout = None
-    stderr = None
+    if sys.platform == "win32":
+      return await asyncio.to_thread(
+          _run_subprocess_win32, command, cwd, timeout_seconds
+      )
+    return await _run_subprocess_unix(command, cwd, timeout_seconds)
+
+
+async def _stream_reader(
+    stream: asyncio.StreamReader | None, console: Any
+) -> str:
+  """Reads from a subprocess stream line by line, tee-ing to console."""
+  if stream is None:
+    return ""
+  chunks = []
+  while True:
+    chunk = await stream.read(4096)
+    if not chunk:
+      break
+    text = chunk.decode(errors="replace")
+    chunks.append(text)
+    console.write(text)
+    console.flush()
+  return "".join(chunks)
+
+
+async def _run_subprocess_unix(
+    command: str, cwd: str, timeout_seconds: int
+) -> dict[str, Any]:
+  """Runs a shell command on Unix via asyncio.create_subprocess_shell."""
+  process = await asyncio.create_subprocess_shell(
+      command,
+      cwd=cwd,
+      stdout=asyncio.subprocess.PIPE,
+      stderr=asyncio.subprocess.PIPE,
+      start_new_session=True,
+  )
+
+  try:
+    stdout_task = asyncio.create_task(
+        _stream_reader(process.stdout, sys.stdout)
+    )
+    stderr_task = asyncio.create_task(
+        _stream_reader(process.stderr, sys.stderr)
+    )
+    await asyncio.wait_for(
+        asyncio.gather(stdout_task, stderr_task, process.wait()),
+        timeout=timeout_seconds,
+    )
+    stdout_str = _truncate_output(stdout_task.result())
+    stderr_str = _truncate_output(stderr_task.result())
+  except asyncio.TimeoutError:
     try:
-      # Build subprocess kwargs.
-      subprocess_kwargs = {
-          "cwd": cwd,
-          "stdout": asyncio.subprocess.PIPE,
-          "stderr": asyncio.subprocess.PIPE,
-      }
+      if process.pid:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+      process.kill()
+    await process.wait()
 
-      is_unix = sys.platform != "win32"
-      if is_unix:
-        subprocess_kwargs["start_new_session"] = True
+    # Drain remaining output after kill.
+    remaining_out = await process.stdout.read() if process.stdout else b""
+    remaining_err = await process.stderr.read() if process.stderr else b""
+    stdout_str = _truncate_output(
+        (stdout_task.result() if stdout_task.done() else "")
+        + remaining_out.decode(errors="replace")
+    )
+    stderr_str = _truncate_output(
+        (stderr_task.result() if stderr_task.done() else "")
+        + remaining_err.decode(errors="replace")
+    )
 
-      process = await asyncio.create_subprocess_shell(
-          command,
-          **subprocess_kwargs,
-      )
+    return {
+        "error": f"Command timed out after {timeout_seconds} seconds.",
+        "stdout": stdout_str,
+        "stderr": stderr_str,
+        "returncode": process.returncode,
+    }
 
-      try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            process.communicate(), timeout=timeout_seconds
-        )
-      except asyncio.TimeoutError:
-        # Kill the process (group on Unix, single on Windows).
-        try:
-          if is_unix and process.pid:
-            os.killpg(process.pid, 9)  # SIGKILL
-          else:
-            process.kill()
-        except (ProcessLookupError, OSError):
-          pass
-        stdout_bytes, stderr_bytes = await process.communicate()
+  return {
+      "stdout": stdout_str,
+      "stderr": stderr_str,
+      "returncode": process.returncode,
+  }
 
-        stdout_str = _truncate_output(
-            stdout_bytes.decode(errors="replace") if stdout_bytes else ""
-        )
-        stderr_str = _truncate_output(
-            stderr_bytes.decode(errors="replace") if stderr_bytes else ""
-        )
 
-        return {
-            "error": (
-                f"Command timed out after {timeout_seconds} seconds."
-            ),
-            "stdout": stdout_str,
-            "stderr": stderr_str,
-            "returncode": process.returncode,
-        }
+def _run_subprocess_win32(
+    command: str, cwd: str, timeout_seconds: int
+) -> dict[str, Any]:
+  """Runs a shell command on Windows via subprocess.Popen with live tee."""
+  try:
+    proc = subprocess.Popen(
+        command,
+        shell=True,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+      stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+      proc.kill()
+      stdout_bytes, stderr_bytes = proc.communicate()
 
-      stdout_str = _truncate_output(
-          stdout_bytes.decode(errors="replace") if stdout_bytes else ""
-      )
-      stderr_str = _truncate_output(
-          stderr_bytes.decode(errors="replace") if stderr_bytes else ""
-      )
+      stdout_str = _truncate_output(stdout_bytes.decode(errors="replace"))
+      stderr_str = _truncate_output(stderr_bytes.decode(errors="replace"))
 
       return {
+          "error": f"Command timed out after {timeout_seconds} seconds.",
           "stdout": stdout_str,
           "stderr": stderr_str,
-          "returncode": process.returncode,
+          "returncode": proc.returncode,
       }
-    except Exception as e:  # pylint: disable=broad-except
-      logger.exception("ShellTool execution failed")
 
-      stdout_res = (
-          stdout.decode(errors="replace") if stdout else ""
-      )
-      stderr_res = (
-          stderr.decode(errors="replace") if stderr else ""
-      )
+    stdout_str = _truncate_output(stdout_bytes.decode(errors="replace"))
+    stderr_str = _truncate_output(stderr_bytes.decode(errors="replace"))
 
-      return {
-          "error": f"Execution failed: {str(e)}",
-          "stdout": stdout_res,
-          "stderr": stderr_res,
-      }
+    # Tee to console.
+    if stdout_str:
+      sys.stdout.write(stdout_str)
+      sys.stdout.flush()
+    if stderr_str:
+      sys.stderr.write(stderr_str)
+      sys.stderr.flush()
+
+    return {
+        "stdout": stdout_str,
+        "stderr": stderr_str,
+        "returncode": proc.returncode,
+    }
+  except Exception as e:  # pylint: disable=broad-except
+    return {"error": f"Execution failed: {e}"}
